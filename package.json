@@ -1,0 +1,28 @@
+{
+  "name": "@atria/pdf-engine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "description": "Atria PDF engine: PDF in, coordinates / images / SVG out (MuPDF.js, AGPL-3.0)",
+  "engines": {
+    "node": ">=24.14.0"
+  },
+  "main": "./src/main.ts",
+  "scripts": {
+    "start": "node src/main.ts",
+    "dev": "node src/main.ts",
+    "test": "vitest run --root .",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "firebase-admin": "14.5.0",
+    "mupdf": "1.28.1",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.4",
+    "typescript": "6.0.3",
+    "vitest": "5.0.0"
+  }
+}

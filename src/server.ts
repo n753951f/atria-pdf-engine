@@ -172,6 +172,10 @@ async function handlePost(deps: EngineDeps, req: IncomingMessage, res: ServerRes
     throw usageError(error);
   }
   let processed = 0;
+  const finish = () =>
+    lease.finish(processed).catch((error: unknown) => {
+      log.usageError = String(error);
+    });
   try {
     let opened;
     try {
@@ -190,14 +194,14 @@ async function handlePost(deps: EngineDeps, req: IncomingMessage, res: ServerRes
       const result = await route.run(opened.pdf, parsed.data);
       processed = result.pagesProcessed;
       log.pages = processed;
+      // 先記帳並釋放「處理中」再回應：呼叫者收到回應後馬上送下一個請求時不會撞到 busy
+      await finish();
       await sendResult(res, { sourceSha256: opened.sha256, pageCount: opened.pdf.pageCount }, result);
     } finally {
       opened.release();
     }
   } finally {
-    await lease.finish(processed).catch((error: unknown) => {
-      log.usageError = String(error);
-    });
+    await finish();
   }
 }
 

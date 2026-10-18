@@ -9,7 +9,7 @@ import { extractPages, renderSvg } from './operations.ts';
 import { mupdf, openPdf } from './pdf.ts';
 import { createEngineServer } from './server.ts';
 import { SourceCache, directorySourceStore } from './sources.ts';
-import { BusyError, DailyLimitError, docUsageStore, memoryUsageStore, taipeiDay, type UsageDoc } from './usage.ts';
+import { BusyError, DailyLimitError, docUsageStore, memoryUsageStore, taipeiDay, type UsageDoc, type UsageStore } from './usage.ts';
 import { WORD_FLAGS } from './text-layer.ts';
 
 const WIDTH = 612;
@@ -216,6 +216,43 @@ describe('驗證與權限', () => {
     now += 331_000;
     await expect(store.acquire('u')).resolves.toBeDefined();
     expect(taipeiDay(Date.UTC(2026, 9, 17, 16, 0, 0))).toBe('2026-10-18');
+  });
+});
+
+describe('用量的釋放', () => {
+  it('回應之前就釋放「處理中」：收到回應後馬上送下一個請求不會 busy（Firestore 的寫入比較慢）', async () => {
+    const memory = memoryUsageStore(1000);
+    const slow: UsageStore = {
+      async acquire(uid) {
+        const lease = await memory.acquire(uid);
+        return {
+          ...lease,
+          finish: async (pages) => {
+            await new Promise((resolve) => setTimeout(resolve, 80));
+            await lease.finish(pages);
+          },
+        };
+      },
+    };
+    const sources = new SourceCache(directorySourceStore(join(dir, 'src')), { dir: join(dir, 'cache3'), maxBytes: 50_000_000, maxOpen: 1 });
+    const server = createEngineServer({
+      verifier: { verify: () => Promise.resolve({ uid: USER }) },
+      sources,
+      usage: slow,
+      source: { repository: 'r', commit: 'c' },
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${String((server.address() as AddressInfo).port)}/v1/info`;
+    const statuses: number[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const res = await fetch(url, { method: 'POST', headers: { authorization: 'Bearer x' }, body: JSON.stringify({ source: SOURCE }) });
+      statuses.push(res.status);
+      await res.arrayBuffer();
+    }
+    expect(statuses).toEqual([200, 200, 200]);
+    server.closeAllConnections();
+    server.close();
+    sources.close();
   });
 });
 

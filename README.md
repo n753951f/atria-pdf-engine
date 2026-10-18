@@ -29,7 +29,7 @@ Atria（原文教科書閱讀器）用到 MuPDF 的部分全部集中在這個�
 ## 執行
 
 ```bash
-npm install
+npm ci   # package-lock.json 固定所有依賴的版本
 # 本機：用 GOOGLE_APPLICATION_CREDENTIALS 指向的憑證讀 Firebase
 PORT=8790 node src/main.ts
 npm test
@@ -37,4 +37,5 @@ npm test
 
 環境變數：`PORT`、`ENGINE_PROJECT_ID`、`ENGINE_BUCKET`、`ENGINE_DAILY_PAGE_LIMIT`、`ENGINE_CACHE_DIR`、`ENGINE_CACHE_MAX_BYTES`、`ENGINE_SOURCE_REPOSITORY`、`ENGINE_SOURCE_COMMIT`。
 
-部署（Cloud Run，asia-east1、最少 0／最多 2 個執行個體、2 GiB、逾時 300 秒）用這個資料夾的 `Dockerfile`。
+部署（Cloud Run，asia-east1、最少 0／最多 2 個執行個體、2 GiB、逾時 300 秒）用這個資料夾的 `Dockerfile`；
+部署中的版本就是這個儲存庫 `main` 的 commit（`GET /v1/source` 的 `commit`）。

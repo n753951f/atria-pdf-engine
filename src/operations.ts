@@ -239,6 +239,58 @@ export interface RenderMeta {
 
 export class InvalidClipError extends Error {}
 
+/**
+ * 轉 SVG 時的影像：mupdf 的 SVG 輸出把 JPEG 原封不動嵌進去，CMYK（4 色）的 JPEG 在瀏覽器裡顏色會反相
+ * （PDF 用 /Decode 把 Adobe 反相的 CMYK 轉回來，嵌進 SVG 後這個資訊就不見了）。
+ * 所以 CMYK 的影像先依 PDF 的設定（含 /Decode）解成 RGB 點陣，再交給 SVG 輸出（變成 PNG）。
+ */
+function svgSafeImage(image: mupdf.Image): mupdf.Image {
+  const colorspace = image.getColorSpace();
+  if (image.getImageMask() || !colorspace || colorspace.getNumberOfComponents() !== 4) return image;
+  const pixmap = image.toPixmap();
+  try {
+    const rgb = pixmap.convertToColorSpace(mupdf.ColorSpace.DeviceRGB, true);
+    const mask = image.getMask();
+    return mask ? new mupdf.Image(rgb, mask) : new mupdf.Image(rgb);
+  } finally {
+    pixmap.destroy();
+  }
+}
+
+type DeviceColor = Parameters<mupdf.Device['fillPath']>[4];
+/** callback 給的顏色是 number[]，device 的方法要 Color（長度 1–4 的 tuple） */
+function deviceColor(color: number[]): DeviceColor {
+  return color as unknown as DeviceColor;
+}
+
+/** 把所有呼叫轉給 SVG 輸出的 device，只有影像先經過 svgSafeImage */
+function svgImageFixDevice(target: mupdf.Device): mupdf.Device {
+  return new mupdf.Device({
+    fillPath: (path, evenOdd, ctm, colorspace, color, alpha) => target.fillPath(path, evenOdd, ctm, colorspace, deviceColor(color), alpha),
+    strokePath: (path, stroke, ctm, colorspace, color, alpha) => target.strokePath(path, stroke, ctm, colorspace, deviceColor(color), alpha),
+    clipPath: (path, evenOdd, ctm) => target.clipPath(path, evenOdd, ctm),
+    clipStrokePath: (path, stroke, ctm) => target.clipStrokePath(path, stroke, ctm),
+    fillText: (text, ctm, colorspace, color, alpha) => target.fillText(text, ctm, colorspace, deviceColor(color), alpha),
+    strokeText: (text, stroke, ctm, colorspace, color, alpha) => target.strokeText(text, stroke, ctm, colorspace, deviceColor(color), alpha),
+    clipText: (text, ctm) => target.clipText(text, ctm),
+    clipStrokeText: (text, stroke, ctm) => target.clipStrokeText(text, stroke, ctm),
+    ignoreText: (text, ctm) => target.ignoreText(text, ctm),
+    fillShade: (shade, ctm, alpha) => target.fillShade(shade, ctm, alpha),
+    fillImage: (image, ctm, alpha) => target.fillImage(svgSafeImage(image), ctm, alpha),
+    fillImageMask: (image, ctm, colorspace, color, alpha) => target.fillImageMask(image, ctm, colorspace, deviceColor(color), alpha),
+    clipImageMask: (image, ctm) => target.clipImageMask(image, ctm),
+    popClip: () => target.popClip(),
+    beginMask: (bbox, luminosity, colorspace, color) => target.beginMask(bbox, luminosity, colorspace, deviceColor(color)),
+    endMask: () => target.endMask(),
+    beginGroup: (bbox, colorspace, isolated, knockout, blendmode, alpha) => target.beginGroup(bbox, colorspace, isolated, knockout, blendmode, alpha),
+    endGroup: () => target.endGroup(),
+    beginTile: (area, view, xstep, ystep, ctm, id, docId) => target.beginTile(area, view, xstep, ystep, ctm, id, docId),
+    endTile: () => target.endTile(),
+    beginLayer: (name) => target.beginLayer(name),
+    endLayer: () => target.endLayer(),
+  });
+}
+
 /** 一頁（或裁切範圍）→ SVG 字串：文字轉成字形路徑，原點在範圍的左上角，單位 pt */
 export function renderSvg(pdf: OpenedPdf, page: number, clip: Rect | null): { svg: string; box: Rect } {
   return withPage(pdf, page, (loaded) => {
@@ -260,7 +312,13 @@ export function renderSvg(pdf: OpenedPdf, page: number, clip: Rect | null): { sv
       device.clipPath(rect, false, mupdf.Matrix.identity);
       rect.destroy();
       // mupdf 座標＝PDF 座標＋頁面原點
-      loaded.run(device, mupdf.Matrix.translate(-(x + frame.x0), -(y + frame.y0)));
+      const fixed = svgImageFixDevice(device);
+      try {
+        loaded.run(fixed, mupdf.Matrix.translate(-(x + frame.x0), -(y + frame.y0)));
+        fixed.close();
+      } finally {
+        fixed.destroy();
+      }
       device.popClip();
       writer.endPage();
       writer.close();

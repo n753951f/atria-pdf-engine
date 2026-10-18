@@ -368,4 +368,46 @@ describe('PDF 進、座標／圖片／SVG 出', () => {
       pdf.close();
     }
   });
+
+  it('renderSvg 的 CMYK 影像：嵌進 SVG 的是 RGB 的 PNG，顏色和 mupdf 算圖一致（真書的 Adobe CMYK JPEG 原封不動嵌入時會反相；合成的 JPEG 重現不出來，只驗證結果）', () => {
+    // 一頁只有一張純青色（C=100%）的 CMYK JPEG
+    const cmyk = new mupdf.Pixmap(mupdf.ColorSpace.DeviceCMYK, [0, 0, 40, 20], false);
+    const pixels = cmyk.getPixels();
+    for (let i = 0; i < pixels.length; i += 4) {
+      pixels[i] = 255;
+      pixels[i + 1] = 0;
+      pixels[i + 2] = 0;
+      pixels[i + 3] = 0;
+    }
+    const jpeg = cmyk.asJPEG(90, false);
+    const buffer = new mupdf.Buffer();
+    const writer = new mupdf.DocumentWriter(buffer, 'pdf', '');
+    const device = writer.beginPage([0, 0, 200, 100]);
+    device.fillImage(new mupdf.Image(jpeg), [100, 0, 0, 50, 50, 25], 1);
+    writer.endPage();
+    writer.close();
+    const pdf = openPdf(buffer.asUint8Array().slice());
+    try {
+      const { svg } = renderSvg(pdf, 1, null);
+      expect(svg).not.toContain('data:image/jpeg');
+      const png = /data:image\/png;base64,([^"]+)"/.exec(svg)?.[1] ?? '';
+      expect(png.length).toBeGreaterThan(0);
+      // 嵌進去的影像和 mupdf 自己算圖（頁面圖）的顏色相同
+      const image = new mupdf.Image(Buffer.from(png.replace(/\s/g, ''), 'base64'));
+      const embedded = image.toPixmap();
+      const page = pdf.loadPage(1);
+      const raster = page.toPixmap(mupdf.Matrix.identity, mupdf.ColorSpace.DeviceRGB, false, true);
+      page.destroy();
+      const at = (pix: mupdf.Pixmap, x: number, y: number) => {
+        const n = pix.getNumberOfComponents();
+        const i = (y * pix.getWidth() + x) * n;
+        return Array.from(pix.getPixels().slice(i, i + 3));
+      };
+      const a = at(embedded, 20, 10);
+      const b = at(raster, 100, 50);
+      for (let k = 0; k < 3; k += 1) expect(Math.abs((a[k] ?? 0) - (b[k] ?? 0)), `${JSON.stringify(a)} vs ${JSON.stringify(b)}`).toBeLessThan(40);
+    } finally {
+      pdf.close();
+    }
+  });
 });

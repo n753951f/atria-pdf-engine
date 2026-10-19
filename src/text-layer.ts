@@ -43,6 +43,25 @@ export interface ExtractedWord {
   readonly font: string;
   readonly flags: number;
   readonly conf: null;
+  /**
+   * 沒有正確 Unicode 的字元（U+FFFD、私用區、控制字元；多半是 PDF 字型的 ToUnicode 缺漏或錯誤）的字型與字形編號。
+   * 只有含這種字元的單字才有這個欄位。
+   */
+  readonly glyphs?: readonly UnmappedGlyph[];
+}
+
+export interface UnmappedGlyph {
+  /** 單字裡的第幾個字元（以 code point 計，從 0 起） */
+  readonly at: number;
+  /** 字型名稱（去掉子集前綴） */
+  readonly font: string;
+  /** 字型裡的字形編號（同一個字型、同一個編號＝畫出來是同一個字形）；對不到頁面內容時 -1 */
+  readonly gid: number;
+}
+
+/** 沒有正確 Unicode 的字元：U+FFFD、私用區 U+E000–U+F8FF、C0／C1 控制字元 */
+export function isUnmappedCode(code: number): boolean {
+  return code === 0xfffd || (code >= 0xe000 && code <= 0xf8ff) || code < 0x20 || (code >= 0x7f && code <= 0x9f);
 }
 
 /** p0018w0453 */
@@ -62,6 +81,8 @@ export interface PageContent {
   readonly invisibleGlyphs: number;
   /** 看不見的字的原點（unicode@x,y），抽單字時排除 */
   readonly invisibleKeys: ReadonlySet<string>;
+  /** 看得見、但沒有正確 Unicode 的字（unicode@x,y → 字型與字形編號），抽單字時附在單字上 */
+  readonly unmappedGlyphs: ReadonlyMap<string, Omit<UnmappedGlyph, 'at'>>;
   readonly images: readonly Box[];
   readonly drawings: readonly Box[];
 }
@@ -97,6 +118,7 @@ export function scanPageContent(page: MupdfPage): PageContent {
   let visibleGlyphs = 0;
   let invisibleGlyphs = 0;
   const invisibleKeys = new Set<string>();
+  const unmappedGlyphs = new Map<string, Omit<UnmappedGlyph, 'at'>>();
   const images: Box[] = [];
   const drawings: Box[] = [];
   const toPage = (box: Box): Box | null =>
@@ -104,10 +126,16 @@ export function scanPageContent(page: MupdfPage): PageContent {
 
   const countText = (text: Text, ctm: readonly number[], visible: boolean) => {
     text.walk({
-      showGlyph(_font, trm, _glyph, unicode) {
+      showGlyph(font, trm, glyph, unicode) {
         if (unicode === 32 || unicode === 9 || unicode === 10 || unicode === 13 || unicode === 160) return;
         if (visible) {
           visibleGlyphs += 1;
+          // 沒有 Unicode（負值）的字，structured text 會給 U+FFFD
+          const code = unicode < 0 ? 0xfffd : unicode;
+          if (isUnmappedCode(code)) {
+            const [x, y] = transform(ctm, trm[4] ?? 0, trm[5] ?? 0);
+            unmappedGlyphs.set(glyphKey(code, x, y), { font: font.getName().replace(SUBSET_PREFIX, ''), gid: glyph });
+          }
         } else {
           invisibleGlyphs += 1;
           const [x, y] = transform(ctm, trm[4] ?? 0, trm[5] ?? 0);
@@ -193,7 +221,7 @@ export function scanPageContent(page: MupdfPage): PageContent {
   } finally {
     device.destroy();
   }
-  return { width, height, visibleGlyphs, invisibleGlyphs, invisibleKeys, images, drawings };
+  return { width, height, visibleGlyphs, invisibleGlyphs, invisibleKeys, unmappedGlyphs, images, drawings };
 }
 
 /** 圖片物件的覆蓋率（裁到頁面後的面積總和 ÷ 頁面面積，上限 1） */
@@ -254,6 +282,8 @@ interface CharInfo {
   readonly size: number;
   readonly font: FontInfo;
   readonly color: readonly number[];
+  /** 沒有正確 Unicode 的字元：頁面內容裡對應的字形；其他字元 null */
+  readonly glyph: Omit<UnmappedGlyph, 'at'> | null;
 }
 
 interface LineInfo {
@@ -346,7 +376,8 @@ export function extractTextLayer(
         if (!current) return;
         const [ox = 0, oy = 0] = origin;
         const code = c.codePointAt(0) ?? 0;
-        if (content.invisibleKeys.has(glyphKey(code, ox, oy))) return;
+        const key = glyphKey(code, ox, oy);
+        if (content.invisibleKeys.has(key)) return;
         const xs = [quad[0], quad[2], quad[4], quad[6]].map((v) => (v ?? 0) - frame.x0);
         const ys = [quad[1], quad[3], quad[5], quad[7]].map((v) => (v ?? 0) - frame.y0);
         current.chars.push({
@@ -357,6 +388,7 @@ export function extractTextLayer(
           size,
           font: fontInfo(font),
           color: [...color],
+          glyph: isUnmappedCode(code) ? (content.unmappedGlyphs.get(key) ?? { font: fontInfo(font).name, gid: -1 }) : null,
         });
       },
     });
@@ -411,6 +443,12 @@ export function extractTextLayer(
     if (piece.chars.some((ch) => ch.font.math || isMathChar(ch.c))) flags |= WORD_FLAGS.math;
     if (piece.script === 'superscript') flags |= WORD_FLAGS.superscript;
     if (piece.script === 'subscript') flags |= WORD_FLAGS.subscript;
+    const glyphs: UnmappedGlyph[] = [];
+    let at = 0;
+    for (const ch of piece.chars) {
+      if (ch.glyph) glyphs.push({ at, ...ch.glyph });
+      at += [...ch.c].length;
+    }
     words.push({
       id: wordId(pageNumber, words.length + 1),
       text,
@@ -420,6 +458,7 @@ export function extractTextLayer(
       font: anchor.font.name,
       flags,
       conf: null,
+      ...(glyphs.length > 0 ? { glyphs } : {}),
     });
   }
   markHyphenation(words);

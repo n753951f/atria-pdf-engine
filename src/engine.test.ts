@@ -48,6 +48,37 @@ function buildPdf(): Uint8Array {
   return buffer.asUint8Array().slice();
 }
 
+/**
+ * 一頁 ToUnicode 寫錯的文字：字碼 1（Omega 字形）、2（Delta 字形）對到 U+FFFD、3（bullet 字形）對到私用區 U+E001，
+ * 就像真書把 Ω、Δ 抽成「�」。手寫 PDF（mupdf 的 DocumentWriter 會自己產生正確的 ToUnicode）。
+ */
+function buildMisencodedPdf(): Uint8Array {
+  const cmap =
+    '/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /Misencoded def ' +
+    '1 begincodespacerange <00> <FF> endcodespacerange 3 beginbfchar <01> <FFFD> <02> <FFFD> <03> <E001> endbfchar ' +
+    'endcmap CMapName currentdict /CMap defineresource pop end end';
+  const content = 'BT /F1 11 Tf 72 700 Td (R = 1.8 k\\001 and \\002V \\001 \\003) Tj ET';
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${String(WIDTH)} ${String(HEIGHT)}] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding /Differences [1 /Omega 2 /Delta 3 /bullet] >> /ToUnicode 6 0 R >>',
+    `<< /Length ${String(content.length)} >>\nstream\n${content}\nendstream`,
+    `<< /Length ${String(cmap.length)} >>\nstream\n${cmap}\nendstream`,
+  ];
+  let out = '%PDF-1.4\n';
+  const offsets: number[] = [];
+  objects.forEach((body, i) => {
+    offsets.push(out.length);
+    out += `${String(i + 1)} 0 obj\n${body}\nendobj\n`;
+  });
+  const xref = out.length;
+  const entries = offsets.map((o) => `${String(o).padStart(10, '0')} 00000 n \n`).join('');
+  out += `xref\n0 ${String(objects.length + 1)}\n0000000000 65535 f \n${entries}`;
+  out += `trailer\n<< /Size ${String(objects.length + 1)} /Root 1 0 R >>\nstartxref\n${String(xref)}\n%%EOF\n`;
+  return new TextEncoder().encode(out);
+}
+
 const USER = 'user_a';
 const OTHER = 'user_b';
 const SOURCE = `users/${USER}/books/bk1/source.pdf`;
@@ -357,6 +388,27 @@ describe('PDF 進、座標／圖片／SVG 出', () => {
     }
     expect(clipped).toContain('viewBox="0 0 300 100"');
     expect((await post('/v1/render', { source: SOURCE, items: [{ page: 1, clip: [700, 0, 10, 10] }] })).status).toBe(400);
+  });
+
+  it('ToUnicode 對不到的字（U+FFFD、私用區）：單字帶 glyphs（第幾個字元、字型、字形編號），同一個字形編號相同；其他單字沒有這個欄位', async () => {
+    const pdf = openPdf(buildMisencodedPdf());
+    try {
+      const { meta } = await extractPages(pdf, [1]);
+      const words = meta.pages[0]?.words ?? [];
+      expect(words.map((w) => w.text)).toEqual(['R', '=', '1.8', 'k�', 'and', '�V', '�', '\uE001']);
+      const byText = (text: string) => words.find((w) => w.text === text);
+      const omega = byText('k�')?.glyphs ?? [];
+      const delta = byText('�V')?.glyphs ?? [];
+      expect(omega).toEqual([{ at: 1, font: 'Helvetica', gid: expect.any(Number) as number }]);
+      expect(delta).toEqual([{ at: 0, font: 'Helvetica', gid: expect.any(Number) as number }]);
+      // 第二個 Omega（字碼 1）和 k� 的是同一個字形；Delta 是另一個
+      expect(byText('�')?.glyphs?.[0]?.gid).toBe(omega[0]?.gid);
+      expect(delta[0]?.gid).not.toBe(omega[0]?.gid);
+      expect(byText('\uE001')?.glyphs).toEqual([{ at: 0, font: 'Helvetica', gid: expect.any(Number) as number }]);
+      for (const text of ['R', '=', '1.8', 'and']) expect(byText(text)).not.toHaveProperty('glyphs');
+    } finally {
+      pdf.close();
+    }
   });
 
   it('renderSvg 的裁切：範圍外的字不在裁切後的可見範圍（clipPath）', () => {

@@ -12,6 +12,7 @@ import { z } from 'zod';
 import type { TokenVerifier } from './firebase.ts';
 import {
   InvalidClipError,
+  RenderFailedError,
   classifyPdf,
   extractPages,
   infoOf,
@@ -194,6 +195,8 @@ async function handlePost(deps: EngineDeps, req: IncomingMessage, res: ServerRes
       const result = await route.run(opened.pdf, parsed.data);
       processed = result.pagesProcessed;
       log.pages = processed;
+      const warnings = (result.meta as { warnings?: unknown[] }).warnings;
+      if (Array.isArray(warnings) && warnings.length > 0) log.warnings = warnings;
       // 先記帳並釋放「處理中」再回應：呼叫者收到回應後馬上送下一個請求時不會撞到 busy
       await finish();
       await sendResult(res, { sourceSha256: opened.sha256, pageCount: opened.pdf.pageCount }, result);
@@ -242,7 +245,11 @@ export function createEngineServer(deps: EngineDeps): Server {
         else if (error instanceof PageOutOfRangeError) {
           http = new HttpError(400, 'page_out_of_range', error.message, { page: error.page, pageCount: error.pageCount });
         } else if (error instanceof InvalidClipError) http = new HttpError(400, 'bad_request', error.message);
-        else {
+        else if (error instanceof RenderFailedError) {
+          // 工單 67：跳過畫不出來的物件之後還是不行（重試也不會好，所以不是 5xx，用戶端不會重試）
+          http = new HttpError(422, 'render_failed', error.message, { page: error.page, item: error.item });
+          log.error = error.message;
+        } else {
           http = new HttpError(500, 'internal', 'PDF 引擎內部錯誤');
           log.error = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
         }

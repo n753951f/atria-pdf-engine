@@ -235,9 +235,43 @@ export interface RenderMeta {
   readonly items: readonly RenderMetaItem[];
   /** 這次沒做到的項目在請求裡的索引 */
   readonly next: readonly number[];
+  /** 畫的時候跳過的物件（工單 67）；沒有時是空陣列 */
+  readonly warnings: readonly RenderWarning[];
+}
+
+/**
+ * 可以跳過的物件種類：只有「畫」的呼叫。裁切、群組、遮罩、圖樣（tile）跳過會讓後面的內容錯亂，所以不跳過，
+ * 那些出錯時整項回 render_failed。
+ */
+export type RenderObjectKind = 'shading' | 'image' | 'path' | 'text';
+
+/** render 時跳過的物件：同一項、同一種類合成一筆 */
+export interface RenderWarning {
+  /** 請求裡第幾項（從 0 起） */
+  readonly item: number;
+  readonly page: number;
+  readonly skipped: RenderObjectKind;
+  /** 跳過幾個 */
+  readonly count: number;
+  /** mupdf 的錯誤訊息（第一個） */
+  readonly reason: string;
 }
 
 export class InvalidClipError extends Error {}
+
+/** 跳過畫不出來的物件之後還是畫不出來（或頁面本身讀不了）：伺服器回 422 render_failed */
+export class RenderFailedError extends Error {
+  readonly page: number;
+  /** 請求裡第幾項；renderSvg 單獨呼叫時 null */
+  readonly item: number | null;
+  readonly reason: string;
+  constructor(page: number, reason: string, item: number | null = null) {
+    super(`PDF 頁 ${String(page)} 畫不出來：${reason}`);
+    this.page = page;
+    this.item = item;
+    this.reason = reason;
+  }
+}
 
 /**
  * 轉 SVG 時的影像：mupdf 的 SVG 輸出把 JPEG 原封不動嵌進去，CMYK（4 色）的 JPEG 在瀏覽器裡顏色會反相
@@ -257,42 +291,157 @@ function svgSafeImage(image: mupdf.Image): mupdf.Image {
   }
 }
 
+/**
+ * 工單 67：mupdf.js 1.28.1 自訂 Device 的 fillShade callback 用 `new Shade(pointer)` 包住 mupdf 借給它的指標，
+ * 卻沒有像 Path、Text、Image 那樣先 keep。這個包裝被 GC 回收時 finalizer 會多 drop 一次：shade 被提早釋放，
+ * 但 PDF 的資源快取還指著它（use-after-free）。之後再畫到同一個 shading（引擎會快取打開的 PDF，重試也一樣）
+ * 就讀到被覆寫的記憶體——Cloud Run 上的「Unexpected mesh type 97／115」，或 wasm 直接當掉。
+ * 所以 callback 收到的 Shade 一律取消 finalizer 的登記：這個包裝只是借用，不擁有參考。
+ */
+export function borrowShade(shade: mupdf.Shade): void {
+  const registry = (shade.constructor as { _finalizer?: FinalizationRegistry<unknown> })._finalizer;
+  registry?.unregister(shade);
+}
+
 type DeviceColor = Parameters<mupdf.Device['fillPath']>[4];
 /** callback 給的顏色是 number[]，device 的方法要 Color（長度 1–4 的 tuple） */
 function deviceColor(color: number[]): DeviceColor {
   return color as unknown as DeviceColor;
 }
 
-/** 把所有呼叫轉給 SVG 輸出的 device，只有影像先經過 svgSafeImage */
-function svgImageFixDevice(target: mupdf.Device): mupdf.Device {
+function errorText(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).trim().slice(0, 300);
+}
+
+/** 這一次要跳過哪些「畫」的呼叫：依序編號（同一頁、同一個範圍每次的順序都一樣），或整個種類 */
+interface SkipRule {
+  readonly calls: ReadonlySet<number>;
+  readonly kinds: ReadonlySet<RenderObjectKind>;
+}
+
+interface AttemptLog {
+  /** 畫不出來的呼叫（編號、種類、mupdf 的訊息） */
+  readonly failures: { index: number; kind: RenderObjectKind; reason: string }[];
+  /** 依規則跳過的呼叫 */
+  readonly skipped: { index: number; kind: RenderObjectKind }[];
+  /** 裁切、群組這類不能跳過的呼叫出錯（第一個） */
+  structural: string | null;
+}
+
+/**
+ * 把所有呼叫轉給 SVG 輸出的 device：影像先經過 svgSafeImage、Shade 先 borrowShade。
+ * 每個呼叫都包 try/catch，callback 永遠不丟錯（丟出去的錯會穿過 mupdf 的 wasm 堆疊、跳過它的清理）；
+ * 出錯的記在 log，由 renderSvg 決定跳過重畫還是回 render_failed。
+ */
+function svgProxyDevice(target: mupdf.Device, skip: SkipRule, log: AttemptLog): mupdf.Device {
+  let next = 0;
+  const draw = (kind: RenderObjectKind, call: () => void) => {
+    const index = next;
+    next += 1;
+    if (skip.calls.has(index) || skip.kinds.has(kind)) {
+      log.skipped.push({ index, kind });
+      return;
+    }
+    try {
+      call();
+    } catch (error) {
+      log.failures.push({ index, kind, reason: errorText(error) });
+    }
+  };
+  const structure = <T>(call: () => T, fallback: T): T => {
+    try {
+      return call();
+    } catch (error) {
+      log.structural ??= errorText(error);
+      return fallback;
+    }
+  };
   return new mupdf.Device({
-    fillPath: (path, evenOdd, ctm, colorspace, color, alpha) => target.fillPath(path, evenOdd, ctm, colorspace, deviceColor(color), alpha),
-    strokePath: (path, stroke, ctm, colorspace, color, alpha) => target.strokePath(path, stroke, ctm, colorspace, deviceColor(color), alpha),
-    clipPath: (path, evenOdd, ctm) => target.clipPath(path, evenOdd, ctm),
-    clipStrokePath: (path, stroke, ctm) => target.clipStrokePath(path, stroke, ctm),
-    fillText: (text, ctm, colorspace, color, alpha) => target.fillText(text, ctm, colorspace, deviceColor(color), alpha),
-    strokeText: (text, stroke, ctm, colorspace, color, alpha) => target.strokeText(text, stroke, ctm, colorspace, deviceColor(color), alpha),
-    clipText: (text, ctm) => target.clipText(text, ctm),
-    clipStrokeText: (text, stroke, ctm) => target.clipStrokeText(text, stroke, ctm),
-    ignoreText: (text, ctm) => target.ignoreText(text, ctm),
-    fillShade: (shade, ctm, alpha) => target.fillShade(shade, ctm, alpha),
-    fillImage: (image, ctm, alpha) => target.fillImage(svgSafeImage(image), ctm, alpha),
-    fillImageMask: (image, ctm, colorspace, color, alpha) => target.fillImageMask(image, ctm, colorspace, deviceColor(color), alpha),
-    clipImageMask: (image, ctm) => target.clipImageMask(image, ctm),
-    popClip: () => target.popClip(),
-    beginMask: (bbox, luminosity, colorspace, color) => target.beginMask(bbox, luminosity, colorspace, deviceColor(color)),
-    endMask: () => target.endMask(),
-    beginGroup: (bbox, colorspace, isolated, knockout, blendmode, alpha) => target.beginGroup(bbox, colorspace, isolated, knockout, blendmode, alpha),
-    endGroup: () => target.endGroup(),
-    beginTile: (area, view, xstep, ystep, ctm, id, docId) => target.beginTile(area, view, xstep, ystep, ctm, id, docId),
-    endTile: () => target.endTile(),
-    beginLayer: (name) => target.beginLayer(name),
-    endLayer: () => target.endLayer(),
+    fillPath: (path, evenOdd, ctm, colorspace, color, alpha) =>
+      draw('path', () => target.fillPath(path, evenOdd, ctm, colorspace, deviceColor(color), alpha)),
+    strokePath: (path, stroke, ctm, colorspace, color, alpha) =>
+      draw('path', () => target.strokePath(path, stroke, ctm, colorspace, deviceColor(color), alpha)),
+    clipPath: (path, evenOdd, ctm) => structure(() => target.clipPath(path, evenOdd, ctm), undefined),
+    clipStrokePath: (path, stroke, ctm) => structure(() => target.clipStrokePath(path, stroke, ctm), undefined),
+    fillText: (text, ctm, colorspace, color, alpha) => draw('text', () => target.fillText(text, ctm, colorspace, deviceColor(color), alpha)),
+    strokeText: (text, stroke, ctm, colorspace, color, alpha) =>
+      draw('text', () => target.strokeText(text, stroke, ctm, colorspace, deviceColor(color), alpha)),
+    clipText: (text, ctm) => structure(() => target.clipText(text, ctm), undefined),
+    clipStrokeText: (text, stroke, ctm) => structure(() => target.clipStrokeText(text, stroke, ctm), undefined),
+    ignoreText: (text, ctm) => structure(() => target.ignoreText(text, ctm), undefined),
+    fillShade: (shade, ctm, alpha) => {
+      borrowShade(shade);
+      draw('shading', () => target.fillShade(shade, ctm, alpha));
+    },
+    fillImage: (image, ctm, alpha) => draw('image', () => target.fillImage(svgSafeImage(image), ctm, alpha)),
+    fillImageMask: (image, ctm, colorspace, color, alpha) =>
+      draw('image', () => target.fillImageMask(image, ctm, colorspace, deviceColor(color), alpha)),
+    clipImageMask: (image, ctm) => structure(() => target.clipImageMask(image, ctm), undefined),
+    popClip: () => structure(() => target.popClip(), undefined),
+    beginMask: (bbox, luminosity, colorspace, color) => structure(() => target.beginMask(bbox, luminosity, colorspace, deviceColor(color)), undefined),
+    endMask: () => structure(() => target.endMask(), undefined),
+    beginGroup: (bbox, colorspace, isolated, knockout, blendmode, alpha) =>
+      structure(() => target.beginGroup(bbox, colorspace, isolated, knockout, blendmode, alpha), undefined),
+    endGroup: () => structure(() => target.endGroup(), undefined),
+    beginTile: (area, view, xstep, ystep, ctm, id, docId) => structure(() => target.beginTile(area, view, xstep, ystep, ctm, id, docId), 0),
+    endTile: () => structure(() => target.endTile(), undefined),
+    beginLayer: (name) => structure(() => target.beginLayer(name), undefined),
+    endLayer: () => structure(() => target.endLayer(), undefined),
   });
 }
 
-/** 一頁（或裁切範圍）→ SVG 字串：文字轉成字形路徑，原點在範圍的左上角，單位 pt */
-export function renderSvg(pdf: OpenedPdf, page: number, clip: Rect | null): { svg: string; box: Rect } {
+/** 畫一次：範圍 [x, y, w, h]（PDF 座標）→ SVG；出錯的呼叫記在 log */
+function renderSvgAttempt(loaded: mupdf.Page, origin: { x0: number; y0: number }, box: Rect, skip: SkipRule): { svg: string | null; log: AttemptLog } {
+  const [x, y, w, h] = box;
+  const log: AttemptLog = { failures: [], skipped: [], structural: null };
+  const buffer = new mupdf.Buffer();
+  const writer = new mupdf.DocumentWriter(buffer, 'svg', 'text=path');
+  try {
+    const device = writer.beginPage([0, 0, w, h]);
+    const rect = new mupdf.Path();
+    rect.rect(0, 0, w, h);
+    device.clipPath(rect, false, mupdf.Matrix.identity);
+    rect.destroy();
+    // mupdf 座標＝PDF 座標＋頁面原點
+    const proxy = svgProxyDevice(device, skip, log);
+    try {
+      loaded.run(proxy, mupdf.Matrix.translate(-(x + origin.x0), -(y + origin.y0)));
+      proxy.close();
+    } catch (error) {
+      // 頁面內容本身讀不了（不是某個物件畫不出來）
+      log.structural ??= errorText(error);
+    } finally {
+      proxy.destroy();
+    }
+    device.popClip();
+    writer.endPage();
+    writer.close();
+    return { svg: buffer.asString(), log };
+  } catch (error) {
+    log.structural ??= errorText(error);
+    return { svg: null, log };
+  } finally {
+    writer.destroy();
+    buffer.destroy();
+  }
+}
+
+/** 最多畫幾次：第 1 次照畫；第 2、3 次跳過前面畫不出來的那幾個物件；第 4 次跳過出過錯的整個種類 */
+export const MAX_RENDER_ATTEMPTS = 4;
+
+export interface SvgRender {
+  readonly svg: string;
+  readonly box: Rect;
+  /** 跳過的物件（依種類合計；沒有時空陣列） */
+  readonly skipped: readonly { readonly kind: RenderObjectKind; readonly count: number; readonly reason: string }[];
+}
+
+/**
+ * 一頁（或裁切範圍）→ SVG 字串：文字轉成字形路徑，原點在範圍的左上角，單位 pt。
+ * 工單 67：單一物件（漸層、影像…）畫不出來時不讓整頁失敗：跳過那個物件重畫，跳過的記在 skipped；
+ * 跳過之後還是不行、或是裁切／群組這類不能跳過的出錯、或頁面內容本身讀不了 → RenderFailedError。
+ */
+export function renderSvg(pdf: OpenedPdf, page: number, clip: Rect | null): SvgRender {
   return withPage(pdf, page, (loaded) => {
     const frame = pageFrame(loaded);
     let [x, y, w, h] = clip ?? [0, 0, frame.width, frame.height];
@@ -303,29 +452,26 @@ export function renderSvg(pdf: OpenedPdf, page: number, clip: Rect | null): { sv
     w = x1 - x;
     h = y1 - y;
     if (!(w > 0 && h > 0)) throw new InvalidClipError(`PDF 頁 ${String(page)} 的裁切範圍在頁面外或是空的`);
-    const buffer = new mupdf.Buffer();
-    const writer = new mupdf.DocumentWriter(buffer, 'svg', 'text=path');
-    try {
-      const device = writer.beginPage([0, 0, w, h]);
-      const rect = new mupdf.Path();
-      rect.rect(0, 0, w, h);
-      device.clipPath(rect, false, mupdf.Matrix.identity);
-      rect.destroy();
-      // mupdf 座標＝PDF 座標＋頁面原點
-      const fixed = svgImageFixDevice(device);
-      try {
-        loaded.run(fixed, mupdf.Matrix.translate(-(x + frame.x0), -(y + frame.y0)));
-        fixed.close();
-      } finally {
-        fixed.destroy();
+    const box: Rect = [round(x), round(y), round(w), round(h)];
+    const calls = new Set<number>();
+    const kinds = new Set<RenderObjectKind>();
+    const reasons = new Map<RenderObjectKind, string>();
+    for (let attempt = 1; ; attempt += 1) {
+      const { svg, log } = renderSvgAttempt(loaded, frame, [x, y, w, h], { calls, kinds });
+      if (log.structural !== null || svg === null) throw new RenderFailedError(page, log.structural ?? '沒有輸出');
+      if (log.failures.length === 0) {
+        const counts = new Map<RenderObjectKind, number>();
+        for (const s of log.skipped) counts.set(s.kind, (counts.get(s.kind) ?? 0) + 1);
+        const skipped = [...counts].map(([kind, count]) => ({ kind, count, reason: reasons.get(kind) ?? '' }));
+        return { svg, box, skipped };
       }
-      device.popClip();
-      writer.endPage();
-      writer.close();
-      return { svg: buffer.asString(), box: [round(x), round(y), round(w), round(h)] };
-    } finally {
-      writer.destroy();
-      buffer.destroy();
+      for (const f of log.failures) if (!reasons.has(f.kind)) reasons.set(f.kind, f.reason);
+      if (attempt >= MAX_RENDER_ATTEMPTS) {
+        const first = log.failures[0];
+        throw new RenderFailedError(page, `跳過畫不出來的物件之後還是失敗（${first ? first.reason : ''}）`);
+      }
+      if (attempt + 1 < MAX_RENDER_ATTEMPTS) for (const f of log.failures) calls.add(f.index);
+      else for (const kind of reasons.keys()) kinds.add(kind);
     }
   });
 }
@@ -338,6 +484,7 @@ export async function renderItems(
   for (const item of items) pdf.loadPage(item.page).destroy();
   const out: RenderMetaItem[] = [];
   const files: OutputFile[] = [];
+  const warnings: RenderWarning[] = [];
   const encoder = new TextEncoder();
   let used = 0;
   let index = 0;
@@ -345,17 +492,24 @@ export async function renderItems(
     const item = items[index];
     if (!item) break;
     if (out.length > 0 && Date.now() > budget.deadline) break;
-    const { svg, box } = renderSvg(pdf, item.page, item.clip ?? null);
-    const bytes = encoder.encode(svg);
+    let rendered: SvgRender;
+    try {
+      rendered = renderSvg(pdf, item.page, item.clip ?? null);
+    } catch (error) {
+      if (error instanceof RenderFailedError) throw new RenderFailedError(error.page, error.reason, index);
+      throw error;
+    }
+    const bytes = encoder.encode(rendered.svg);
     if (out.length > 0 && used + bytes.length > budget.bytes) break;
     used += bytes.length;
     const name = `r${String(index).padStart(3, '0')}.svg`;
-    out.push({ page: item.page, box, svg: name, bytes: bytes.length });
+    out.push({ page: item.page, box: rendered.box, svg: name, bytes: bytes.length });
     files.push({ name, type: 'image/svg+xml', bytes });
+    for (const s of rendered.skipped) warnings.push({ item: index, page: item.page, skipped: s.kind, count: s.count, reason: s.reason });
     await yieldToLoop();
   }
   return {
-    meta: { items: out, next: items.slice(index).map((_, i) => index + i) },
+    meta: { items: out, next: items.slice(index).map((_, i) => index + i), warnings },
     files,
     pagesProcessed: out.length,
   };

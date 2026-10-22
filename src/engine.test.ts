@@ -1,14 +1,18 @@
 // 引擎自己的測試：用 mupdf 畫一份小 PDF（文字頁＋掃描頁），起一個本機伺服器（資料夾來源、固定 token、記憶體用量），
 // 檢查 HTTP API 的回應、驗證、配額，以及抽字、頁面圖與 SVG 的內容。
+import { readFileSync } from 'node:fs';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { extractPages, renderSvg } from './operations.ts';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { MAX_RENDER_ATTEMPTS, RenderFailedError, extractPages, renderItems, renderSvg } from './operations.ts';
 import { mupdf, openPdf } from './pdf.ts';
 import { createEngineServer } from './server.ts';
 import { SourceCache, directorySourceStore } from './sources.ts';
+import { buildShadingPdf } from './test-fixtures.ts';
 import { BusyError, DailyLimitError, docUsageStore, memoryUsageStore, taipeiDay, type UsageDoc, type UsageStore } from './usage.ts';
 import { WORD_FLAGS } from './text-layer.ts';
 
@@ -82,6 +86,9 @@ function buildMisencodedPdf(): Uint8Array {
 const USER = 'user_a';
 const OTHER = 'user_b';
 const SOURCE = `users/${USER}/books/bk1/source.pdf`;
+/** 工單 67 的漸層網格 PDF（fixtures/mesh-shading.pdf） */
+const SHADING_SOURCE = `users/${USER}/books/bk3/source.pdf`;
+const SHADING_FIXTURE = new URL('../fixtures/mesh-shading.pdf', import.meta.url);
 let dir: string;
 let baseUrl: string;
 let close: () => Promise<void>;
@@ -90,6 +97,8 @@ beforeAll(async () => {
   dir = await mkdtemp(join(tmpdir(), 'pdf-engine-test-'));
   await mkdir(join(dir, 'src', 'users', USER, 'books', 'bk1'), { recursive: true });
   await mkdir(join(dir, 'src', 'users', OTHER, 'books', 'bk2'), { recursive: true });
+  await mkdir(join(dir, 'src', 'users', USER, 'books', 'bk3'), { recursive: true });
+  await writeFile(join(dir, 'src', ...SHADING_SOURCE.split('/')), readFileSync(SHADING_FIXTURE));
   const bytes = buildPdf();
   await writeFile(join(dir, 'src', ...SOURCE.split('/')), bytes);
   await writeFile(join(dir, 'src', 'users', OTHER, 'books', 'bk2', 'source.pdf'), bytes);
@@ -137,7 +146,8 @@ interface TestBody {
   readonly pageSizes: unknown[];
   readonly pages: TestPage[];
   readonly next: number[];
-  readonly items: { readonly box: number[] }[];
+  readonly items: { readonly box: number[]; readonly svg: string }[];
+  readonly warnings: { readonly item: number; readonly page: number; readonly skipped: string; readonly count: number; readonly reason: string }[];
 }
 
 async function post(path: string, body: unknown, token: string | null = 'token-a') {
@@ -461,5 +471,164 @@ describe('PDF 進、座標／圖片／SVG 出', () => {
     } finally {
       pdf.close();
     }
+  });
+});
+
+describe('壞掉的漸層網格（工單 67：Cloud Run 的 Unexpected mesh type 97／115）', () => {
+  const decode = (bytes: Uint8Array | undefined) => new TextDecoder().decode(bytes);
+  /** text=path 的 SVG：每個字形是一個 <use>；漸層畫成 <image> */
+  const glyphs = (svg: string) => (svg.match(/<use /g) ?? []).length;
+  const images = (svg: string) => (svg.match(/<image /g) ?? []).length;
+  /** 強制 GC：mupdf.js 的 finalizer 只在 GC 之後才跑 */
+  const collect = (() => {
+    setFlagsFromString('--expose-gc');
+    const gc = runInNewContext('gc') as () => void;
+    return async () => {
+      gc();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    };
+  })();
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('fixtures/mesh-shading.pdf 和產生它的程式（test-fixtures.ts）一致', () => {
+    expect(Buffer.from(readFileSync(SHADING_FIXTURE)).equals(Buffer.from(buildShadingPdf()))).toBe(true);
+  });
+
+  it('同一份打開的 PDF 反覆畫漸層網格、中間跑 GC：每次都畫得出來、結果相同（mupdf.js 的 Shade 包裝不再多 drop 一次）', async () => {
+    const pdf = openPdf(buildShadingPdf());
+    try {
+      const first = renderSvg(pdf, 1, null);
+      expect(first.skipped).toEqual([]);
+      // 四個正常的網格、線性漸層與 shading pattern 都畫成影像；壞掉的 shading（97、115、截斷、BitsPerFlag 3）mupdf 自己略過
+      expect(images(first.svg)).toBeGreaterThanOrEqual(6);
+      expect(glyphs(first.svg)).toBeGreaterThan(40);
+      for (let i = 0; i < 25; i += 1) {
+        await collect();
+        const again = renderSvg(pdf, 1, i % 2 === 0 ? null : [60, 380, 500, 200]);
+        expect(again.skipped).toEqual([]);
+        if (i % 2 === 0) expect(again.svg).toBe(first.svg);
+      }
+    } finally {
+      pdf.close();
+    }
+  });
+
+  it('漸層畫不出來時跳過那個漸層、其他照畫，skipped 記下種類、個數與 mupdf 的訊息', () => {
+    const pdf = openPdf(buildShadingPdf());
+    try {
+      const normal = renderSvg(pdf, 1, null);
+      // 只有第一個漸層畫不出來
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- 原本的方法，在 mock 裡以收到的 device 當 this 呼叫
+      const original = mupdf.Device.prototype.fillShade;
+      let failed = false;
+      vi.spyOn(mupdf.Device.prototype, 'fillShade').mockImplementation(function (this: mupdf.Device, ...args) {
+        if (!failed) {
+          failed = true;
+          throw new Error('Unexpected mesh type 97');
+        }
+        original.apply(this, args);
+      });
+      const one = renderSvg(pdf, 1, null);
+      expect(one.skipped).toEqual([{ kind: 'shading', count: 1, reason: 'Unexpected mesh type 97' }]);
+      expect(images(one.svg)).toBe(images(normal.svg) - 1);
+      expect(glyphs(one.svg)).toBe(glyphs(normal.svg));
+      // 所有漸層都畫不出來：全部跳過，文字照畫
+      vi.restoreAllMocks();
+      vi.spyOn(mupdf.Device.prototype, 'fillShade').mockImplementation(() => {
+        throw new Error('Unexpected mesh type 115');
+      });
+      const none = renderSvg(pdf, 1, null);
+      expect(none.skipped).toEqual([{ kind: 'shading', count: expect.any(Number) as number, reason: 'Unexpected mesh type 115' }]);
+      expect(none.skipped[0]?.count).toBeGreaterThanOrEqual(6);
+      expect(images(none.svg)).toBe(0);
+      expect(glyphs(none.svg)).toBe(glyphs(normal.svg));
+    } finally {
+      pdf.close();
+    }
+  });
+
+  it('跳過之後還是畫不出來、或頁面內容本身讀不了：RenderFailedError（哪一頁、原因），不是一般的例外', async () => {
+    const pdf = openPdf(buildShadingPdf());
+    try {
+      vi.spyOn(mupdf.Page.prototype, 'run').mockImplementation(() => {
+        throw new Error('syntax error in content stream');
+      });
+      expect(() => renderSvg(pdf, 1, null)).toThrow(RenderFailedError);
+      expect(() => renderSvg(pdf, 1, null)).toThrow('PDF 頁 1 畫不出來：syntax error in content stream');
+      await expect(renderItems(pdf, [{ page: 2 }, { page: 1 }])).rejects.toMatchObject({ page: 2, item: 0 });
+      // 每次重畫都有另一個漸層畫不出來（像 mupdf 出錯後停用整個 device，後面的錯要下一次才看得到）：
+      // 第 2、3 次只跳過出錯的那幾個，第 MAX_RENDER_ATTEMPTS 次跳過整個種類
+      vi.restoreAllMocks();
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- 原本的方法，在 mock 裡以收到的 device 當 this 呼叫
+      const original = mupdf.Device.prototype.fillShade;
+      const seen = new WeakSet<mupdf.Device>();
+      let thrown = 0;
+      vi.spyOn(mupdf.Device.prototype, 'fillShade').mockImplementation(function (this: mupdf.Device, ...args) {
+        if (!seen.has(this)) {
+          seen.add(this);
+          thrown += 1;
+          throw new Error(`broken shade ${String(thrown)}`);
+        }
+        original.apply(this, args);
+      });
+      const escalated = renderSvg(pdf, 1, null);
+      expect(thrown).toBe(MAX_RENDER_ATTEMPTS - 1);
+      expect(escalated.skipped).toEqual([{ kind: 'shading', count: expect.any(Number) as number, reason: 'broken shade 1' }]);
+      expect(escalated.skipped[0]?.count).toBeGreaterThanOrEqual(6);
+      expect(images(escalated.svg)).toBe(0);
+      vi.restoreAllMocks();
+      // 跳過整個種類之後還是不行（第 MAX_RENDER_ATTEMPTS 次換文字畫不出來）
+      const devices: mupdf.Device[] = [];
+      vi.spyOn(mupdf.Device.prototype, 'fillShade').mockImplementation(function (this: mupdf.Device) {
+        if (!devices.includes(this)) {
+          devices.push(this);
+          throw new Error('broken shade');
+        }
+      });
+      vi.spyOn(mupdf.Device.prototype, 'fillText').mockImplementation(function (this: mupdf.Device) {
+        if (devices.length >= MAX_RENDER_ATTEMPTS - 1 && !devices.includes(this)) throw new Error('broken text');
+      });
+      expect(() => renderSvg(pdf, 1, null)).toThrow(/PDF 頁 1 畫不出來：跳過畫不出來的物件之後還是失敗（broken text）/);
+      vi.restoreAllMocks();
+      // 裁切這類不能跳過的出錯：直接 RenderFailedError
+      vi.spyOn(mupdf.Device.prototype, 'clipPath').mockImplementation(() => {
+        throw new Error('broken clip');
+      });
+      expect(() => renderSvg(pdf, 1, null)).toThrow(/PDF 頁 1 畫不出來：broken clip/);
+    } finally {
+      pdf.close();
+    }
+  });
+
+  it('/v1/render：漸層畫不出來時 200＋warnings（第幾項、哪一頁、跳過什麼），SVG 照樣有文字；正常時 warnings 是空的', async () => {
+    const items = [{ page: 2 }, { page: 1 }, { page: 1, clip: [60, 380, 500, 200] }];
+    const normal = await post('/v1/render', { source: SHADING_SOURCE, items });
+    expect(normal.status).toBe(200);
+    expect(normal.body.warnings).toEqual([]);
+    vi.spyOn(mupdf.Device.prototype, 'fillShade').mockImplementation(() => {
+      throw new Error('Unexpected mesh type 97');
+    });
+    const { status, body, files } = await post('/v1/render', { source: SHADING_SOURCE, items });
+    expect(status).toBe(200);
+    expect(body.items).toHaveLength(3);
+    expect(body.warnings.map((w) => [w.item, w.page, w.skipped, w.reason])).toEqual([
+      [1, 1, 'shading', 'Unexpected mesh type 97'],
+      [2, 1, 'shading', 'Unexpected mesh type 97'],
+    ]);
+    const full = decode(files.get(body.items[1]?.svg ?? ''));
+    expect(images(full)).toBe(0);
+    expect(glyphs(full)).toBe(glyphs(decode(normal.files.get(normal.body.items[1]?.svg ?? ''))));
+  });
+
+  it('/v1/render：真的畫不出來時 422 render_failed（訊息有頁碼與原因、detail 有 page 與 item），不是 500 internal', async () => {
+    vi.spyOn(mupdf.Page.prototype, 'run').mockImplementation(() => {
+      throw new Error('Unexpected mesh type 115');
+    });
+    const { status, body } = await post('/v1/render', { source: SHADING_SOURCE, items: [{ page: 1 }] });
+    expect(status).toBe(422);
+    expect(body.error).toMatchObject({ code: 'render_failed', message: 'PDF 頁 1 畫不出來：Unexpected mesh type 115', page: 1, item: 0 });
   });
 });

@@ -27,6 +27,7 @@ Atria（原文教科書閱讀器）用到 MuPDF 的部分全部集中在這個�
 - 一次回應最多約 24 MB、做 200 秒；做不完的頁（或 render 的項目索引）放在 `next`，照樣再請求一次。
 - render 的 `warnings[{ item, page, skipped, count, reason }]`：畫的時候跳過的物件（`item` 是請求裡第幾項，`skipped` 是 `shading`／`image`／`path`／`text`，`reason` 是 mupdf 的訊息；沒有時空陣列）。單一物件畫不出來時不讓整項失敗：跳過那個物件重畫（最多畫 4 次：第 2、3 次跳過前面出錯的那幾個，第 4 次跳過出過錯的整個種類），其他內容照畫。裁切、群組、遮罩這類不能跳過的出錯、跳過之後還是不行、或頁面內容本身讀不了時回 `422 render_failed`（`message`「PDF 頁 N 畫不出來：原因」，另有 `page`、`item`）。
 - 錯誤：`{ error: { code, message } }`。`401 unauthenticated`、`403 forbidden`、`404 source_not_found`、`400 bad_request`／`page_out_of_range`、`422 render_failed`（只有 render）、`429 busy`（同一個帳號同時只能有一個請求）／`daily_limit`（每人每天 3000 頁，台北時間）。
+- Admins (ID tokens whose `admin` custom claim is `true`) are exempt from the daily page limit: requests are never rejected with `daily_limit`, pages are still counted in `users/{uid}/engine/usage` (which also records `unlimited: true`), and the one-request-at-a-time `busy` limit still applies. 管理員（ID token 的 `admin` 自訂宣告是 `true`）不受每日頁數上限：不回 `daily_limit`，頁數照樣記在 `users/{uid}/engine/usage`（另記 `unlimited: true`），同時 1 個請求（`busy`）照舊。
 
 ## 執行
 

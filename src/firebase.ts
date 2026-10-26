@@ -7,9 +7,15 @@ import { getStorage } from 'firebase-admin/storage';
 import { SourceNotFoundError, type SourceStore } from './sources.ts';
 import type { UsageDoc, UsageDocStore } from './usage.ts';
 
+export interface VerifiedToken {
+  readonly uid: string;
+  /** ID token 有 admin 自訂宣告（ADR-0006）：不受每日頁數上限（工單 85）；沒有時當作 false */
+  readonly admin?: boolean;
+}
+
 export interface TokenVerifier {
   /** 無效時丟錯 */
-  verify(idToken: string): Promise<{ uid: string }>;
+  verify(idToken: string): Promise<VerifiedToken>;
 }
 
 export interface FirebaseServices {
@@ -27,7 +33,8 @@ export function firebaseServices(options: { projectId: string; bucket: string })
     verifier: {
       async verify(idToken) {
         const decoded = await auth.verifyIdToken(idToken);
-        return { uid: decoded.uid };
+        // 只認布林的 true（宣告由 npm run admin:grant 設定）
+        return { uid: decoded.uid, admin: decoded.admin === true };
       },
     },
     sources: {

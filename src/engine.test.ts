@@ -222,6 +222,74 @@ describe('驗證與權限', () => {
     sources.close();
   });
 
+  it('工單 85：admin 宣告的 token 超過每日上限照樣通過、用量照樣增加、同時 1 個請求照舊；一般使用者照舊 429', async () => {
+    // 用量儲存：unlimited 的租約 reserve 不丟、用完額度後還拿得到；一般的照舊丟
+    const memory = memoryUsageStore(2);
+    const a = await memory.acquire('admin', { unlimited: true });
+    expect(a.unlimited).toBe(true);
+    a.reserve(3000);
+    await expect(memory.acquire('admin', { unlimited: true })).rejects.toThrow(BusyError);
+    await a.finish(3000);
+    const b = await memory.acquire('admin', { unlimited: true });
+    expect(b.used).toBe(3000);
+    b.reserve(1);
+    await b.finish(1);
+    await expect(memory.acquire('admin')).rejects.toThrow(DailyLimitError);
+
+    // Firestore 版：用量照樣累加，文件記 unlimited（管理後台顯示「不限」）
+    let doc: UsageDoc | null = null;
+    const now = Date.UTC(2026, 9, 26, 4, 0, 0);
+    const store = docUsageStore(
+      {
+        transact(_uid, update) {
+          doc = update(doc);
+          return Promise.resolve(doc);
+        },
+      },
+      10,
+      () => now,
+    );
+    const c = await store.acquire('admin', { unlimited: true });
+    expect(doc).toMatchObject({ unlimited: true });
+    await expect(store.acquire('admin', { unlimited: true })).rejects.toThrow(BusyError);
+    c.reserve(25);
+    await c.finish(25);
+    expect(doc).toMatchObject({ day: '2026-10-26', pages: 25, busyUntil: 0, unlimited: true });
+    await (await store.acquire('admin', { unlimited: true })).finish(5);
+    expect(doc).toMatchObject({ pages: 30 });
+    await expect(store.acquire('admin')).rejects.toThrow(DailyLimitError);
+
+    // 伺服器：額度只有 2 頁，classify 整本 3 頁——admin 的 token 200 且記 3 頁，一般的 token 429
+    const sources = new SourceCache(directorySourceStore(join(dir, 'src')), { dir: join(dir, 'cache4'), maxBytes: 50_000_000, maxOpen: 1 });
+    const usage = memoryUsageStore(2);
+    const logs: Record<string, unknown>[] = [];
+    const server = createEngineServer({
+      verifier: { verify: (t) => Promise.resolve(t === 'admin' ? { uid: USER, admin: true } : { uid: USER }) },
+      sources,
+      usage,
+      source: { repository: 'r', commit: 'c' },
+      log: (entry) => logs.push(entry),
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${String((server.address() as AddressInfo).port)}/v1/classify`;
+    const call = async (token: string) => {
+      const res = await fetch(url, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: JSON.stringify({ source: SOURCE }) });
+      return { status: res.status, body: (await res.json()) as { pageCount?: number; error?: { code: string; used: number } } };
+    };
+    const first = await call('admin');
+    expect([first.status, first.body.pageCount]).toEqual([200, 3]);
+    const second = await call('admin');
+    expect(second.status).toBe(200);
+    const plain = await call('user');
+    expect(plain.status).toBe(429);
+    expect(plain.body.error).toMatchObject({ code: 'daily_limit', used: 6 });
+    expect(logs.filter((l) => l.admin === true).map((l) => l.pages)).toEqual([3, 3]);
+    expect(logs.find((l) => l.status === 429)?.admin).toBeUndefined();
+    server.closeAllConnections();
+    server.close();
+    sources.close();
+  });
+
   it('同一個使用者同時第二個請求：BusyError（伺服器回 429 busy）；租約過期或做完後可以再拿', async () => {
     const memory = memoryUsageStore(100);
     const first = await memory.acquire('u');

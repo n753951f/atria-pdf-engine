@@ -6,7 +6,7 @@
 //   POST /v1/extract   指定頁的單字與旗標、向量圖形與圖片物件的外框、150 dpi 頁面圖（掃描頁另給 300 dpi）
 //   POST /v1/render    頁面或裁切範圍 → SVG（文字轉路徑）
 // POST 都要 Authorization: Bearer <Firebase ID token>，body 是 JSON，source 只能是呼叫者自己的
-// users/{uid}/books/{bookId}/….pdf。有檔案的回應是 multipart/form-data：meta（JSON）＋各個檔案。
+// users/{uid}/books/{bookId}/….pdf。token 有 admin 宣告的不受每日頁數上限（工單 85）。有檔案的回應是 multipart/form-data：meta（JSON）＋各個檔案。
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { z } from 'zod';
 import type { TokenVerifier } from './firebase.ts';
@@ -150,12 +150,16 @@ async function handlePost(deps: EngineDeps, req: IncomingMessage, res: ServerRes
   if (!route) throw new HttpError(404, 'not_found', `沒有這個端點：${path}`);
   const token = bearer(req);
   let uid: string;
+  let admin: boolean;
   try {
-    ({ uid } = await deps.verifier.verify(token));
+    const verified = await deps.verifier.verify(token);
+    uid = verified.uid;
+    admin = verified.admin === true;
   } catch {
     throw new HttpError(401, 'unauthenticated', '登入無效或已過期：請重新取得 Firebase ID token');
   }
   log.uid = uid;
+  if (admin) log.admin = true;
   const raw = await readBody(req);
   const parsed = route.schema.safeParse(raw);
   if (!parsed.success) {
@@ -168,7 +172,8 @@ async function handlePost(deps: EngineDeps, req: IncomingMessage, res: ServerRes
 
   let lease;
   try {
-    lease = await deps.usage.acquire(uid);
+    // 工單 85：管理員不受每日頁數上限（照樣記帳、照樣同時 1 個請求）
+    lease = await deps.usage.acquire(uid, { unlimited: admin });
   } catch (error) {
     throw usageError(error);
   }

@@ -18,6 +18,7 @@ const server = createEngineServer({
   verifier: services.verifier,
   sources,
   usage: docUsageStore(services.usageDocs, config.dailyPageLimit),
+  books: services.books,
   source: { repository: config.repository, commit: config.commit },
   log: (entry) => {
     process.stdout.write(`${JSON.stringify({ severity: Number(entry.status) >= 500 ? 'ERROR' : 'INFO', ...entry })}\n`);

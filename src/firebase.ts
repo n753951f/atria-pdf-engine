@@ -4,6 +4,7 @@ import { initializeApp, type App } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
 import { getStorage } from 'firebase-admin/storage';
+import type { BookDirectory, BookRecord } from './books.ts';
 import { SourceNotFoundError, type SourceStore } from './sources.ts';
 import type { UsageDoc, UsageDocStore } from './usage.ts';
 
@@ -22,6 +23,8 @@ export interface FirebaseServices {
   readonly verifier: TokenVerifier;
   readonly sources: SourceStore;
   readonly usageDocs: UsageDocStore;
+  /** 工單 91：擁有者的書文件（讀別人的公開書時） */
+  readonly books: BookDirectory;
 }
 
 export function firebaseServices(options: { projectId: string; bucket: string }): FirebaseServices {
@@ -56,6 +59,12 @@ export function firebaseServices(options: { projectId: string; bucket: string })
             return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
           },
         };
+      },
+    },
+    books: {
+      async get(uid, bookId) {
+        const snap = await firestore.doc(`users/${uid}/books/${bookId}`).get();
+        return snap.exists ? (snap.data() as BookRecord) : null;
       },
     },
     usageDocs: {

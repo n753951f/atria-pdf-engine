@@ -9,7 +9,11 @@ Atria（原文教科書閱讀器）用到 MuPDF 的部分全部集中在這個�
 ## API
 
 除了 `GET /v1/source`，每個請求都是 `POST`、body 是 JSON，並帶 `Authorization: Bearer <Firebase ID token>`。
-`source` 是呼叫者自己在 Firebase Storage 的 `users/{uid}/books/{bookId}/source.pdf`（uid 和 token 不同時回 403）。
+`source` 是呼叫者自己在 Firebase Storage 的 `users/{uid}/books/{bookId}/source.pdf`，或別人的**公開書**的原始 PDF
+（Atria 工單 91：擁有者的書文件 `users/{uid}/books/{bookId}` 的 `visibility` 是 `public`、`trashedAt` 是 null、不是引用書，
+而且 `pdf.path` 就是這個 `source`；其他情況回 403）。讀別人的公開書時，每日頁數與同時 1 個請求都算**呼叫者**的。
+
+Reading someone else's book is allowed only for a public book: the owner's Firestore document `users/{uid}/books/{bookId}` must have `visibility: 'public'`, `trashedAt: null`, no `source` field, and `pdf.path` equal to the requested `source`; otherwise `403 forbidden`. Usage (daily pages and the one-request-at-a-time lease) is charged to the caller.
 
 | 端點 | body | 回應 |
 |---|---|---|
@@ -38,7 +42,7 @@ PORT=8790 node src/main.ts
 npm test
 ```
 
-`fixtures/mesh-shading.pdf`：測試用的合成 PDF（`src/test-fixtures.ts` 的 `buildShadingPdf()` 產生，測試會檢查兩者一致）：第 1 頁有文字、ShadingType 4–7 的漸層網格、shading pattern、線性漸層，以及壞掉的 shading（ShadingType 97、115、資料截斷、BitsPerFlag 3）；第 2 頁只有文字。本機只想對這份 PDF 試 render 時用 `src/test-server.ts`（`ENGINE_TEST_SOURCE_DIR` 指到放 `users/<uid>/books/<bookId>/source.pdf` 的資料夾、`ENGINE_TEST_TOKENS='{"t":"<uid>"}'`，不碰 Firebase）。
+`fixtures/mesh-shading.pdf`：測試用的合成 PDF（`src/test-fixtures.ts` 的 `buildShadingPdf()` 產生，測試會檢查兩者一致）：第 1 頁有文字、ShadingType 4–7 的漸層網格、shading pattern、線性漸層，以及壞掉的 shading（ShadingType 97、115、資料截斷、BitsPerFlag 3）；第 2 頁只有文字。本機只想對這份 PDF 試 render 時用 `src/test-server.ts`（`ENGINE_TEST_SOURCE_DIR` 指到放 `users/<uid>/books/<bookId>/source.pdf` 的資料夾、`ENGINE_TEST_TOKENS='{"t":"<uid>"}'`，不碰 Firebase；別人的公開書看同一個資料夾的 `books.json`：`{ "users/<uid>/books/<bookId>": { "visibility": "public", "trashedAt": null, "pdf": { "path": "…" } } }`）。
 
 環境變數：`PORT`、`ENGINE_PROJECT_ID`、`ENGINE_BUCKET`、`ENGINE_DAILY_PAGE_LIMIT`、`ENGINE_CACHE_DIR`、`ENGINE_CACHE_MAX_BYTES`、`ENGINE_SOURCE_REPOSITORY`、`ENGINE_SOURCE_COMMIT`。
 

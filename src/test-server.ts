@@ -1,7 +1,9 @@
 // 測試用的引擎（只在本機跑，Cloud Run 不會用到這支）：
 // 原始 PDF 從本機資料夾讀（path 對應到 ENGINE_TEST_SOURCE_DIR 底下的檔案），
-// token 是 ENGINE_TEST_TOKENS（JSON：token → uid），用量記在記憶體。只聽 127.0.0.1。
+// token 是 ENGINE_TEST_TOKENS（JSON：token → uid），用量記在記憶體；別人的公開書（工單 91）看
+// ENGINE_TEST_SOURCE_DIR/books.json（{ "users/<uid>/books/<bookId>": 書的文件 }）。只聽 127.0.0.1。
 import type { AddressInfo } from 'node:net';
+import { directoryBookStore } from './books.ts';
 import { readConfig } from './config.ts';
 import { createEngineServer } from './server.ts';
 import { SourceCache, directorySourceStore } from './sources.ts';
@@ -27,6 +29,7 @@ const server = createEngineServer({
   },
   sources,
   usage: memoryUsageStore(config.dailyPageLimit),
+  books: directoryBookStore(dir),
   source: { repository: config.repository, commit: 'test' },
 });
 server.listen(config.port, '127.0.0.1', () => {

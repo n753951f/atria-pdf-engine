@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { isReadablePublicSource, type BookDirectory, type BookRecord } from './books.ts';
 import { MAX_RENDER_ATTEMPTS, RenderFailedError, extractPages, renderItems, renderSvg } from './operations.ts';
 import { mupdf, openPdf } from './pdf.ts';
 import { createEngineServer } from './server.ts';
@@ -92,6 +93,11 @@ const SHADING_FIXTURE = new URL('../fixtures/mesh-shading.pdf', import.meta.url)
 let dir: string;
 let baseUrl: string;
 let close: () => Promise<void>;
+/** 工單 91：擁有者的書文件（讀別人的公開書時引擎查它）；鍵是 users/<uid>/books/<bookId> */
+const bookDocs = new Map<string, BookRecord>();
+const books: BookDirectory = { get: (uid, bookId) => Promise.resolve(bookDocs.get(`users/${uid}/books/${bookId}`) ?? null) };
+/** 使用量記在誰身上（主伺服器的 memoryUsageStore 包一層） */
+const charged: { uid: string; pages: number }[] = [];
 
 beforeAll(async () => {
   dir = await mkdtemp(join(tmpdir(), 'pdf-engine-test-'));
@@ -110,7 +116,28 @@ beforeAll(async () => {
   const server = createEngineServer({
     verifier: { verify: (t) => (tokens.has(t) ? Promise.resolve({ uid: tokens.get(t) ?? '' }) : Promise.reject(new Error('bad'))) },
     sources,
-    usage: memoryUsageStore(1000),
+    usage: (() => {
+      const inner = memoryUsageStore(1000);
+      return {
+        async acquire(uid: string, options?: { unlimited?: boolean }) {
+          const lease = await inner.acquire(uid, options);
+          let finished = false;
+          return {
+            ...lease,
+            reserve: (pages: number) => {
+              lease.reserve(pages);
+            },
+            finish: async (pages: number) => {
+              // 伺服器回應前與 finally 都會呼叫（第二次不算）
+              if (!finished) charged.push({ uid, pages });
+              finished = true;
+              await lease.finish(pages);
+            },
+          };
+        },
+      } satisfies UsageStore;
+    })(),
+    books,
     source: { repository: 'https://example.test/engine', commit: 'abc123' },
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -195,6 +222,38 @@ describe('驗證與權限', () => {
     expect([range.status, range.body.error.code, range.body.error.pageCount]).toEqual([400, 'page_out_of_range', 3]);
   });
 
+  it('工單 91：別人的公開書（公開、不在回收桶、pdf.path 相同）讀得到，用量記在呼叫者；不公開、回收桶、引用書、路徑不同都 403', async () => {
+    const other = `users/${OTHER}/books/bk2/source.pdf`;
+    const key = `users/${OTHER}/books/bk2`;
+    const publicDoc: BookRecord = { visibility: 'public', trashedAt: null, pdf: { path: other } };
+    try {
+      bookDocs.set(key, publicDoc);
+      charged.length = 0;
+      const ok = await post('/v1/classify', { source: other });
+      expect([ok.status, ok.body.pages.length]).toEqual([200, 3]);
+      expect(charged).toEqual([{ uid: USER, pages: 3 }]);
+
+      const denied: [string, BookRecord | null][] = [
+        ['不公開', { ...publicDoc, visibility: 'private' }],
+        ['沒有 visibility（＝private）', { trashedAt: null, pdf: { path: other } }],
+        ['回收桶', { ...publicDoc, trashedAt: { seconds: 1, nanoseconds: 0 } }],
+        ['引用書', { ...publicDoc, source: { ownerUid: 'x' } }],
+        ['pdf.path 不是這個檔', { ...publicDoc, pdf: { path: `users/${OTHER}/books/bk2/other.pdf` } }],
+        ['書不存在', null],
+      ];
+      for (const [label, doc] of denied) {
+        if (doc) bookDocs.set(key, doc);
+        else bookDocs.delete(key);
+        const res = await post('/v1/info', { source: other });
+        expect([label, res.status, res.body.error.code]).toEqual([label, 403, 'forbidden']);
+      }
+    } finally {
+      bookDocs.delete(key);
+    }
+    expect(isReadablePublicSource(publicDoc, other)).toBe(true);
+    expect(isReadablePublicSource(publicDoc, `users/${OTHER}/books/bk2/x.pdf`)).toBe(false);
+  });
+
   it('超過每日上限回 429 daily_limit（訊息寫出已用與上限）', async () => {
     const usage = memoryUsageStore(2);
     const lease = await usage.acquire('u');
@@ -208,6 +267,7 @@ describe('驗證與權限', () => {
       verifier: { verify: () => Promise.resolve({ uid: USER }) },
       sources,
       usage: memoryUsageStore(2),
+      books,
       source: { repository: 'r', commit: 'c' },
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -267,6 +327,7 @@ describe('驗證與權限', () => {
       verifier: { verify: (t) => Promise.resolve(t === 'admin' ? { uid: USER, admin: true } : { uid: USER }) },
       sources,
       usage,
+      books,
       source: { repository: 'r', commit: 'c' },
       log: (entry) => logs.push(entry),
     });
@@ -348,6 +409,7 @@ describe('用量的釋放', () => {
       verifier: { verify: () => Promise.resolve({ uid: USER }) },
       sources,
       usage: slow,
+      books,
       source: { repository: 'r', commit: 'c' },
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));

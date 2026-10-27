@@ -5,10 +5,12 @@
 //   POST /v1/pages     指定頁的頁碼標籤、純文字、頁面圖
 //   POST /v1/extract   指定頁的單字與旗標、向量圖形與圖片物件的外框、150 dpi 頁面圖（掃描頁另給 300 dpi）
 //   POST /v1/render    頁面或裁切範圍 → SVG（文字轉路徑）
-// POST 都要 Authorization: Bearer <Firebase ID token>，body 是 JSON，source 只能是呼叫者自己的
-// users/{uid}/books/{bookId}/….pdf。token 有 admin 宣告的不受每日頁數上限（工單 85）。有檔案的回應是 multipart/form-data：meta（JSON）＋各個檔案。
+// POST 都要 Authorization: Bearer <Firebase ID token>，body 是 JSON，source 是呼叫者自己的
+// users/{uid}/books/{bookId}/….pdf，或別人的公開書的原始 PDF（工單 91：擁有者的書文件公開、不在回收桶、pdf.path 相同；
+// 用量照樣記在呼叫者）。token 有 admin 宣告的不受每日頁數上限（工單 85）。有檔案的回應是 multipart/form-data：meta（JSON）＋各個檔案。
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { z } from 'zod';
+import { isReadablePublicSource, type BookDirectory } from './books.ts';
 import type { TokenVerifier } from './firebase.ts';
 import {
   InvalidClipError,
@@ -33,6 +35,8 @@ export interface EngineDeps {
   readonly verifier: TokenVerifier;
   readonly sources: SourceCache;
   readonly usage: UsageStore;
+  /** 工單 91：讀別人的公開書時查擁有者的書文件 */
+  readonly books: BookDirectory;
   /** GET /v1/source 的內容 */
   readonly source: { readonly repository: string; readonly commit: string };
   /** 一行一個請求的紀錄（不含 token） */
@@ -166,9 +170,18 @@ async function handlePost(deps: EngineDeps, req: IncomingMessage, res: ServerRes
     throw new HttpError(400, 'bad_request', `請求內容不合格式：${parsed.error.issues.map((i) => `${i.path.join('.')} ${i.message}`).join('；')}`);
   }
   const body = parsed.data as { source: string };
-  const owner = SOURCE_PATH.exec(body.source)?.[1];
-  if (!owner) throw new HttpError(400, 'bad_request', 'source 要是 users/{uid}/books/{bookId}/….pdf');
-  if (owner !== uid) throw new HttpError(403, 'forbidden', '只能讀自己的書');
+  const match = SOURCE_PATH.exec(body.source);
+  const owner = match?.[1];
+  const bookId = match?.[2];
+  if (!owner || !bookId) throw new HttpError(400, 'bad_request', 'source 要是 users/{uid}/books/{bookId}/….pdf');
+  if (owner !== uid) {
+    // 工單 91（ADR-0025）：別人的書只有公開書（公開、不在回收桶）的原始 PDF 可以讀；用量照樣算呼叫者的
+    const book = await deps.books.get(owner, bookId);
+    if (!isReadablePublicSource(book, body.source)) {
+      throw new HttpError(403, 'forbidden', '只能讀自己的書或公開的書（這本書不是公開的，或已停止公開）');
+    }
+    log.publicOwner = owner;
+  }
 
   let lease;
   try {
